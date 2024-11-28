@@ -5,6 +5,7 @@ import pickle5 as pickle
 import pandas as pd
 from torch.utils.data import Dataset
 import numpy as np
+from config import Config
 
 # 1) read raw pd, 2) split into 3 partitions
 def read_traj_dataset(file_path):
@@ -13,8 +14,12 @@ def read_traj_dataset(file_path):
     trajs = pd.read_pickle(file_path)
 
     l = trajs.shape[0]
+    if Config.dataset_prefix == "porto_20200_new" or Config.dataset_prefix == "beijing_new" or Config.dataset_prefix == "geolife":
+        train_idx = (int(l*0), Config.train_idx)
+    else:
+        train_idx = (int(l * 0), int(l * 0.7))
     # train_idx = (int(l*0), 200000)        # for porto
-    train_idx = (int(l * 0), 70000)       # for t-drive
+    # train_idx = (int(l * 0), 70000)       # for t-drive
     # train_idx = (int(l * 0), int(l*0.7))  # for tky & nyc
     # train_idx = (int(l * 0), 35000)         # for geolife
     eval_idx = (int(l*0.7), int(l*0.8))
