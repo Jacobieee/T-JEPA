@@ -17,13 +17,13 @@ import matplotlib.pyplot as plt
 import plotly.graph_objects as go
 
 from config import Config
-# from utils import tool_funcs
+from utils import tool_funcs
 from utils.cellspace import CellSpace
-# from utils.tool_funcs import lonlat2meters
-# from model.node2vec_ import train_node2vec
+from utils.tool_funcs import lonlat2meters
+from model.node2vec_ import train_node2vec
 from utils.edwp import edwp
 from utils.data_loader import read_trajsimi_traj_dataset
-# from utils.traj import *
+from utils.traj import *
 
 def inrange(lon, lat):
     if lon <= Config.min_lon or lon >= Config.max_lon \
@@ -83,84 +83,16 @@ def clean_and_output_data():
     total_points = dfraw['trajlen'].sum()
     print(f"num of total points: {total_points}.")
     # convert to Mercator
-    # dfraw['merc_seq'] = dfraw.wgs_seq.apply(lambda traj: [list(lonlat2meters(p[0], p[1])) for p in traj])
+    dfraw['merc_seq'] = dfraw.wgs_seq.apply(lambda traj: [list(lonlat2meters(p[0], p[1])) for p in traj])
 
-    # logging.info('Preprocessed-output. #traj={}'.format(dfraw.shape[0]))
-    # dfraw = dfraw[['trajlen', 'wgs_seq', 'merc_seq', 'time_each_point', 'traj_p']].reset_index(drop = True)
-    # print(dfraw.columns)
-    # dfraw.to_pickle(Config.dataset_file)
-    # logging.info('Preprocess end. @={:.0f}'.format(time.time() - _time))
-    # print(dfraw['traj_p'].loc[:10])
+    logging.info('Preprocessed-output. #traj={}'.format(dfraw.shape[0]))
+    dfraw = dfraw[['trajlen', 'wgs_seq', 'merc_seq', 'time_each_point', 'traj_p']].reset_index(drop = True)
+    print(dfraw.columns)
+    dfraw.to_pickle(Config.dataset_file)
+    logging.info('Preprocess end. @={:.0f}'.format(time.time() - _time))
+    print(dfraw['traj_p'].loc[:10])
     return
 
-
-def data_stats():
-    cellspace = pickle.load(open(Config.dataset_cell_file, 'rb'))
-    # embs = pickle.load(open(Config.dataset_embs_file, 'rb'))
-    # https://archive.ics.uci.edu/ml/machine-learning-databases/00339/
-    # download train.csv.zip and unzip it. rename train.csv to porto.csv
-    dfraw = pd.read_csv(Config.root_dir + '/data/porto.csv')
-    dfraw = dfraw.rename(columns = {"POLYLINE": "wgs_seq"})
-    dfraw = dfraw[dfraw.MISSING_DATA == False]
-    dfraw.wgs_seq = dfraw.wgs_seq.apply(literal_eval)
-
-    filtered_groups = dfraw.groupby('TAXI_ID').filter(lambda x: len(x) > 1000)
-    grouped_trips = filtered_groups.groupby('TAXI_ID')
-    trips_by_id = {taxi_id: group for taxi_id, group in grouped_trips}
-
-    # Retrieve the first 5 unique IDs with more than 1000 trajectories
-    unique_ids = filtered_groups['TAXI_ID'].unique()[:5]
-
-    for taxi_id in unique_ids:
-        # Extract only the rows for the current taxi ID
-        data_subset = filtered_groups[filtered_groups['TAXI_ID'] == taxi_id]
-
-        # Create a Plotly map
-        fig = go.Figure()
-
-        # Loop over each row in the data subset for the current taxi ID
-        for index, row in data_subset.iterrows():
-            polyline = row['wgs_seq']
-            # Assuming polyline is a list of tuples (lat, lon)
-            if polyline and all(len(point) == 2 for point in polyline if isinstance(point, list)):
-                latitudes, longitudes = zip(*polyline)
-                fig.add_trace(go.Scattermapbox(
-                    lat=latitudes,
-                    lon=longitudes,
-                    mode='lines+markers',
-                    marker=dict(size=5),
-                    name=f'Trip index {index}'
-                ))
-
-        # Set the layout for the map
-        fig.update_layout(
-            mapbox={
-                'style': "open-street-map",
-                'center': {'lat': sum(latitudes) / len(latitudes), 'lon': sum(longitudes) / len(longitudes)},
-                # Center the map around the average of the coordinates
-                'zoom': 10  # Adjust zoom as needed
-            },
-            title=f"Trajectories for Taxi ID {taxi_id}"
-        )
-
-        # Save the figure to an HTML file
-        file_name = f"Trajectories_{taxi_id}.html"
-        fig.write_html(file_name)
-        print(f"Saved {file_name}")
-    # temp = dfraw.groupby("TAXI_ID").size().reset_index(name='Count')
-    # data = {"ID": temp["TAXI_ID"].values, "num": temp["Count"].values}
-    # print(data)
-
-    # df = pd.DataFrame(data)
-    # print((df['num'] > 1000).sum())
-
-    # # Plotting the bar chart
-    # plt.figure(figsize=(10, 6))
-    # plt.bar(df['ID'], df['num'], color='blue')
-    # plt.xlabel('Unique IDs')
-    # plt.ylabel('Numbers')
-    # plt.title('Number Distribution')
-    # plt.show()
 
 
 def init_cellspace():
@@ -385,68 +317,63 @@ def _simi_comp_operator(fn, df_trajs, sub_idx):
     return simi
 
 
-def read_ft():
-    logging.info('[Load traj dataset] START.')
-    _time = time.time()
-    trajs = pd.read_pickle("../data/porto_20200_new")
+def get_8_neighbors(x, y, cellspace):
+    """
+    Returns 8-connected neighbors of a grid cell (x, y), excluding out-of-bound ones.
+    """
+    directions = [(-1, -1), (0, -1), (1, -1),
+                  (-1, 0),           (1, 0),
+                  (-1, 1),  (0, 1),  (1, 1)]
 
-    l = trajs.shape[0]
-    print(l)
-    # train_idx = (int(l*0), 200000)        # for porto
-    # train_idx = (int(l * 0), 70000)  # for t-drive
-    # train_idx = (int(l * 0), int(l*0.7))
-    # train_idx = (int(l * 0), 35000)         # for geolife
-    offset_idx = int(trajs.shape[0] * 0.7)  # use eval dataset
-    print(offset_idx)
-    df_trajs = trajs.iloc[offset_idx: offset_idx + 10000]
-    # print(df_trajs)
-    # print(df_trajs["wgs_seq"])
-    def array_to_polyline(coordinates):
-        # Create the trajectory string for the entire array
-        trajectory = [f"[{coord[0]}, {coord[1]}]" for coord in coordinates]
-        trajectory_str = f"[{', '.join(trajectory)}]"
-        return trajectory_str
+    neighbors = []
+    for dx, dy in directions:
+        nx, ny = x + dx, y + dy
+        if 0 <= nx < cellspace.x_size and 0 <= ny < cellspace.y_size:
+            neighbors.append((nx, ny))
+    return neighbors
 
-    df_trajs['POLYLINE'] = df_trajs["wgs_seq"].apply(array_to_polyline)
-    print(df_trajs['POLYLINE'])
-    print(df_trajs.shape)
-    df_trajs.to_csv("porto_ft.csv", index=False)
+def generate_cellid_neighbors():
+    x_min, y_min = lonlat2meters(Config.min_lon, Config.min_lat)
+    x_max, y_max = lonlat2meters(Config.max_lon, Config.max_lat)
+    x_min -= Config.cellspace_buffer
+    y_min -= Config.cellspace_buffer
+    x_max += Config.cellspace_buffer
+    y_max += Config.cellspace_buffer
+
+    cell_size = int(Config.cell_size)
+    cellspace = CellSpace(cell_size, cell_size, x_min, y_min, x_max, y_max)
+    cellid_neighbors = {}
+    for x in range(cellspace.x_size):
+        for y in range(cellspace.y_size):
+            cellid = cellspace.get_cellid_by_xyidx(x, y)
+            neighbors = get_8_neighbors(x, y, cellspace)
+            neighbor_ids = []
+            for nx, ny in neighbors:
+                neighbor_id = cellspace.get_cellid_by_xyidx(nx, ny)
+                neighbor_ids.append(neighbor_id)
+            cellid_neighbors[cellid] = neighbor_ids
+
+    with open(Config.neighbours_file, "wb") as f:
+        pickle.dump(cellid_neighbors, f)
 
 
 # nohup python ./preprocessing_porto.py &> ../result &
-# if __name__ == '__main__':
-#     logging.basicConfig(level = logging.DEBUG,
-#                         format = "[%(filename)s:%(lineno)s %(funcName)s()] -> %(message)s",
-#                         handlers = [logging.FileHandler(Config.root_dir+'/exp/log/'+tool_funcs.log_file_name(), mode = 'w'),
-#                                     logging.StreamHandler()]
-#                         )
-#     Config.dataset = 'porto'
-#     Config.post_value_updates()
+if __name__ == '__main__':
+    logging.basicConfig(level = logging.DEBUG,
+                        format = "[%(filename)s:%(lineno)s %(funcName)s()] -> %(message)s",
+                        handlers = [logging.FileHandler(Config.root_dir+'/exp/log/'+tool_funcs.log_file_name(), mode = 'w'),
+                                    logging.StreamHandler()]
+                        )
+    Config.dataset = 'porto'
+    Config.post_value_updates()
 
-    # data_stats()
-    # clean_and_output_data()
-    # init_cellspace()
-    # generate_newsimi_test_dataset()
-    # traj_simi_computation('lcss') # edr edwp discret_frechet hausdorff
-    # read_ft()
-print(Config.dataset)
-dfraw = pd.read_csv(Config.root_dir + '/data/porto.csv')
-dfraw = dfraw.rename(columns={"POLYLINE": "wgs_seq"})
-dfraw = dfraw[dfraw.MISSING_DATA == False]
-# print(dfraw.groupby("TAXI_ID").size())
-# print(dfraw["TIMESTAMP"].loc[0])
-# length requirement
+    clean_and_output_data()
+    init_cellspace()
+    generate_newsimi_test_dataset()
+    traj_simi_computation("hausdorff")
+    traj_simi_computation("discret_frechet")
+    traj_simi_computation("edr")
+    traj_simi_computation("lcss")
 
-dfraw.wgs_seq = dfraw.wgs_seq.apply(literal_eval)
-dfraw['trajlen'] = dfraw.wgs_seq.apply(lambda traj: len(traj))
-dfraw = dfraw[(dfraw.trajlen >= Config.min_traj_len) & (dfraw.trajlen <= Config.max_traj_len)]
-logging.info('Preprocessed-rm length. #traj={}'.format(dfraw.shape[0]))
-
-# range requirement
-dfraw['inrange'] = dfraw.wgs_seq.map(
-    lambda traj: sum([inrange(p[0], p[1]) for p in traj]) == len(traj))  # True: valid
-dfraw = dfraw[dfraw.inrange == True]
-logging.info('Preprocessed-rm range. #traj={}'.format(dfraw.shape[0]))
-total_points = dfraw['trajlen'].sum()
-print(f"num of total points: {total_points}.")
+    generate_cellid_neighbors()
 

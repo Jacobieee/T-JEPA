@@ -89,19 +89,3 @@ def train_node2vec(edge_index):
     return
 
 
-
-# if __name__ == '__main__':
-#     logging.basicConfig(level = logging.DEBUG,
-#                         format = "[%(filename)s:%(lineno)s %(funcName)s()] -> %(message)s",
-#                         handlers = [logging.FileHandler(Config.root_dir+'/exp/log/'+tool_funcs.log_file_name(), mode = 'w'),
-#                                     logging.StreamHandler()]
-#                         )
-#     Config.dataset = 'beijing'
-#     Config.post_value_updates()
-#
-#     cellspace = pickle.load(open(Config.dataset_cell_file, 'rb'))
-#     edge_index_xy, edge_index_id = cellspace.all_neighbour_cell_pairs_permutated_optmized()
-#     # edge_index = [item for sublist in edge_index_id for item in sublist]
-#     edge_index = torch.tensor(edge_index_id, dtype=torch.float).t().contiguous().to(Config.device)
-#     train_node2vec(edge_index)
-

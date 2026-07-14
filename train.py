@@ -2,7 +2,6 @@ import sys
 import logging
 import argparse
 
-from model.trajcl import TrajCLTrainer
 from model.baseline_jepa import TrajJEPATrainer
 from config import Config
 from utils import tool_funcs
@@ -16,6 +15,7 @@ def parse_args():
     parser.add_argument('--dumpfile_uniqueid', type = str, help = 'see config.py')
     parser.add_argument('--seed', type = int, help = '')
     parser.add_argument('--dataset', type = str, help = '')
+    parser.add_argument('--checkpoint_file', type = str, help = '')
 
     args = parser.parse_args()
     return dict(filter(lambda kv: kv[1] is not None, vars(args).items()))
@@ -37,6 +37,4 @@ if __name__ == '__main__':
 
     trajJEPA = TrajJEPATrainer()
     trajJEPA.train()
-    trajJEPA.test()
-    
-    
+

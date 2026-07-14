@@ -12,10 +12,14 @@ from torch.nn.utils.rnn import pad_sequence
 from config import Config as Config
 from utils import tool_funcs
 from utils.data_loader import read_trajsimi_simi_dataset, read_trajsimi_traj_dataset
-from utils.traj import merc2cell2, generate_spatial_features, merc2cell
-from model.graph_func import *
-from utils.preprocessing_porto import get_offset
+from utils.traj import merc2cell2, generate_spatial_features, merc2cell, generate_mask_tokens
+# from utils.preprocessing_porto import get_offset
 
+def get_neighors(traj, nb, embs):
+    """
+    also need to add neighbor embeddings.
+    """
+    return [embs[nb[p]] for p in traj]
 
 # distance regression
 class TrajSimiRegression(nn.Module):
@@ -47,7 +51,34 @@ class TrajSimi:
         
         self.cellspace = pickle.load(open(Config.dataset_cell_file, 'rb'))
         self.cellembs = pickle.load(open(Config.dataset_embs_file, 'rb')).to(Config.device) # tensor
+        self.neighbors = pickle.load(open(Config.neighbours_file, 'rb'))
+        w
+        # Create a tensor version for fast lookups, without changing self.neighbors
+        if isinstance(self.neighbors, dict):
+            if not self.neighbors: # Handle empty dictionary
+                self.neighbors_tensor = torch.empty(0, 0, dtype=torch.long).to(Config.device)
+            else:
+                max_id = max(self.neighbors.keys())
+                
+                # Find the maximum length of neighbor lists to handle ragged lists
+                max_num_neigh = max(len(v) for v in self.neighbors.values())
 
+                # Initialize the table with the correct max length
+                table = torch.zeros(max_id + 1, max_num_neigh, dtype=torch.long)
+
+                # Iterate and pad each neighbor list to the max length
+                for cell_id, neigh_ids in self.neighbors.items():
+                    padded_ids = neigh_ids + [0] * (max_num_neigh - len(neigh_ids)) # Pad with 0
+                    table[cell_id] = torch.tensor(padded_ids, dtype=torch.long)
+
+                self.neighbors_tensor = table.to(Config.device)
+        else: # assuming it's a list of lists or numpy array
+             # Handle potential raggedness in lists of lists
+            if isinstance(self.neighbors[0], (list, np.ndarray)):
+                padded_list = pad_sequence([torch.tensor(x, dtype=torch.long) for x in self.neighbors], batch_first=True, padding_value=0)
+                self.neighbors_tensor = padded_list.to(Config.device)
+            else:
+                self.neighbors_tensor = torch.tensor(self.neighbors, dtype=torch.long).to(Config.device)
 
     def train(self):
         training_starttime = time.time()
@@ -67,77 +98,78 @@ class TrajSimi:
                             'weight_decay': Config.trajsimi_learning_weight_decay}, \
                         {'params': self.encoder.context_encoder.parameters(), \
                             'lr': Config.trajsimi_learning_rate} ] )
-
+        
         scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size = 10, gamma = 0.5)
-
+        
         best_epoch = 0
         best_hr_eval = 0
         bad_counter = 0
         bad_patience = Config.trajsimi_training_bad_patience
-
+        
         for i_ep in range(Config.trajsimi_epoch):
             _time_ep = time.time()
             train_losses = []
             train_gpus = []
             train_rams = []
-
+        
             self.trajsimiregression.train()
             # self.encoder.train()
             self.encoder.eval()
-
+        
             for i_batch, batch in enumerate( self.trajsimi_dataset_generator_pairs_batchi() ):
                 _time_batch = time.time()
                 optimizer.zero_grad()
-
+        
                 trajs_emb, trajs_emb_p, adj, trajs_len, sub_simi = batch
+                # logging.debug(f"load time: {time.time() - _time_batch}")
                 embs = self.encoder.interpret(trajs_emb, trajs_emb_p, trajs_len, adj)
                 # embs = torch.sum(embs, 0)
                 # embs = embs / trajs_len.unsqueeze(-1).expand(embs.shape)
                 outs = self.trajsimiregression(embs.permute(1,0,2))
-
+        
                 pred_l1_simi = torch.cdist(outs, outs, 1)
                 pred_l1_simi = pred_l1_simi[torch.triu(torch.ones(pred_l1_simi.shape), diagonal = 1) == 1]
                 truth_l1_simi = sub_simi[torch.triu(torch.ones(sub_simi.shape), diagonal = 1) == 1]
                 loss_train = self.criterion(pred_l1_simi, truth_l1_simi)
-
+        
                 loss_train.backward()
                 optimizer.step()
                 train_losses.append(loss_train.item())
                 train_gpus.append(tool_funcs.GPUInfo.mem()[0])
                 train_rams.append(tool_funcs.RAMInfo.mem())
-
+        
                 if i_batch % 200 == 0 and i_batch:
                     logging.debug("training. ep-batch={}-{}, train_loss={:.4f}, @={:.3f}, gpu={}, ram={}" \
                                 .format(i_ep, i_batch, loss_train.item(),
                                         time.time()-_time_batch, tool_funcs.GPUInfo.mem(), tool_funcs.RAMInfo.mem()))
-
+        
             scheduler.step() # decay before optimizer when pytorch < 1.1
-
+        
             # i_ep
             logging.info("training. i_ep={}, loss={:.4f}, @={:.3f}" \
                         .format(i_ep, tool_funcs.mean(train_losses), time.time()-_time_ep))
-
+        
             eval_metrics = self.test(dataset_type = 'eval')
             logging.info("eval.     i_ep={}, loss={:.4f}, hr={:.3f},{:.3f},{:.3f} gpu={}, ram={}".format(i_ep, *eval_metrics))
-
+        
             # hr_eval_ep = eval_metrics[1]
             # print(eval_metrics[1:5])
             hr_eval_ep = (eval_metrics[1]+eval_metrics[2]+eval_metrics[3]+eval_metrics[4])/4
             training_gpu_usage = tool_funcs.mean(train_gpus)
             training_ram_usage = tool_funcs.mean(train_rams)
-
+        
             # early stopping
             if  hr_eval_ep > best_hr_eval:
                 best_epoch = i_ep
                 best_hr_eval = hr_eval_ep
                 bad_counter = 0
-
+        
                 torch.save({"encoder_q" : self.encoder.context_encoder.state_dict(),
                             "trajsimi": self.trajsimiregression.state_dict()},
                             self.checkpoint_filepath)
             else:
                 bad_counter += 1
-
+        
             if bad_counter == bad_patience or i_ep + 1 == Config.trajsimi_epoch:
                 training_endtime = time.time()
                 logging.info("training end. @={:.3f}, best_epoch={}, best_hr_eval={:.4f}" \
@@ -165,6 +197,14 @@ class TrajSimi:
                 'task_test_gpu': test_metrics[4], \
                 'task_test_ram': test_metrics[5], \
                 'hr5':test_metrics[1], 'hr20':test_metrics[2], 'hr20in5':test_metrics[3]}
+        # return {
+        #     'task_train_time': 0, \
+        #     'task_train_gpu': 0, \
+        #     'task_train_ram': 0, \
+        #     'task_test_time': test_endtime - test_starttime, \
+        #     'task_test_gpu': test_metrics[4], \
+        #     'task_test_ram': test_metrics[5], \
+        #     'hr5': test_metrics[1], 'hr20': test_metrics[2], 'hr20in5': test_metrics[3]}
 
 
     @torch.no_grad()
@@ -226,22 +266,6 @@ class TrajSimi:
 
             trajs = [datasets[d_idx] for d_idx in range(cur_index, end_index)]
 
-            # def convert_trajectory(trajectory, cellspace):
-            #     """Convert a trajectory to a list of (cell_id, offset_x, offset_y)."""
-            #     return [get_offset(x, y, cellspace) for x, y in trajectory]
-            # # print(trajs)
-            # new_traj = []
-            # for traj in trajs:
-            #     new_trajectory = []
-            #     converted_trajectory = convert_trajectory(traj, self.cellspace)
-            #     # Combine each original and converted point
-            #     for orig, offset in zip(traj, converted_trajectory):
-            #         # Combine orig (x, y) with conv (x*cellspace, y*cellspace)
-            #         combined_point = orig + list(offset)
-            #         new_trajectory.append(combined_point)
-            #     new_traj.append(new_trajectory)
-
-
             # trajs_cell, trajs_p = zip(*[merc2cell2(t, self.cellspace) for t in trajs])
             trajs_cell= [merc2cell(t, self.cellspace) for t in trajs]
 
@@ -253,23 +277,23 @@ class TrajSimi:
             
             trajs_len = torch.tensor(list(map(len, trajs_cell)), dtype = torch.long, device = Config.device)
 
-            max_num_points = trajs_len.max().item()
-            # traj_offsets = [torch.tensor(np.stack(list(traj_o))) for traj_o in point]
-            # print(traj_offsets)
-            # traj_offsets = pad_sequence(traj_offsets, batch_first=True).to(Config.device)
+            # --- This is the new, fast implementation ---
+            traj_idx = pad_sequence(
+                [torch.tensor(t, dtype=torch.long) for t in trajs_cell],
+                batch_first=True,
+                padding_value=-1
+            ).to(Config.device)
 
-            paddings = torch.arange(max_num_points, device=Config.device)[None, :] >= trajs_len[:, None]
-            inv_paddings = ~paddings
+            # Use the pre-computed tensor for fast, vectorized lookup
+            neighbor_ids = self.neighbors_tensor[traj_idx]
 
-            B = trajs_emb_cell.shape[0]
-            # get trajectory adjacency matrix.
-            adj_m, adj = get_adj_matrix(trajs_cell, self.cellspace, self.cellembs, B, max_num_points, inv_paddings)
-            adj_m = adj_m.to(Config.device)
-            adj = adj.to(Config.device)
-            # print(trajs_cell)
-            # print(traj_offsets)
-
-            yield trajs_emb_cell, None, adj, trajs_len
+            # Mask out padded values to avoid errors and ensure correct output
+            mask = traj_idx.eq(-1)
+            neighbor_ids[mask] = 0  # Set padded indices to 0
+            neighbor_seq = self.cellembs[neighbor_ids]
+            neighbor_seq[mask] = 0.0 # Zero out embeddings for padded parts
+            
+            yield trajs_emb_cell, None, neighbor_seq, trajs_len
             cur_index = end_index
 
 
@@ -293,21 +317,6 @@ class TrajSimi:
 
             trajs = [datasets[d_idx] for d_idx in dataset_idxs_sample]
 
-            # def convert_trajectory(trajectory, cellspace):
-            #     """Convert a trajectory to a list of (cell_id, offset_x, offset_y)."""
-            #     return [get_offset(x, y, cellspace) for x, y in trajectory]
-            # print(trajs)
-            # new_traj = []
-            # for traj in trajs:
-            #     new_trajectory = []
-            #     converted_trajectory = convert_trajectory(traj, self.cellspace)
-            #     # Combine each original and converted point
-            #     for orig, offset in zip(traj, converted_trajectory):
-            #         # Combine orig (x, y) with conv (x*cellspace, y*cellspace)
-            #         combined_point = orig + list(offset)
-            #         new_trajectory.append(combined_point)
-            #     new_traj.append(new_trajectory)
-
             # trajs_cell, trajs_p = zip(*[merc2cell2(t, self.cellspace) for t in trajs])
             trajs_cell = [merc2cell(t, self.cellspace) for t in trajs]
             # print(trajs_cell)
@@ -319,21 +328,24 @@ class TrajSimi:
             
             trajs_len = torch.tensor(list(map(len, trajs_cell)), dtype = torch.long, device = Config.device)
 
-            max_num_points = trajs_len.max().item()
-            # traj_offsets = [torch.tensor(np.stack(list(traj_o))) for traj_o in point]
-            # print(traj_offsets)
-            # traj_offsets = pad_sequence(traj_offsets, batch_first=True).to(Config.device)
+            # --- This is the new, fast implementation ---
+            traj_idx = pad_sequence(
+                [torch.tensor(t, dtype=torch.long) for t in trajs_cell],
+                batch_first=True,
+                padding_value=-1
+            ).to(Config.device)
 
-            paddings = torch.arange(max_num_points, device=Config.device)[None, :] >= trajs_len[:, None]
-            inv_paddings = ~paddings
+            # Use the pre-computed tensor for fast, vectorized lookup
+            neighbor_ids = self.neighbors_tensor[traj_idx]
 
-            B = trajs_emb_cell.shape[0]
-            # get trajectory adjacency matrix.
-            adj_m, adj = get_adj_matrix(trajs_cell, self.cellspace, self.cellembs, B, max_num_points, inv_paddings)
-            adj_m = adj_m.to(Config.device)
-            adj = adj.to(Config.device)
-            # print(traj_offsets)
-            yield trajs_emb_cell, None, adj, trajs_len, sub_simi
+            # Mask out padded values to avoid errors and ensure correct output
+            mask = traj_idx.eq(-1)
+            neighbor_ids[mask] = 0  # Set padded indices to 0
+            # print(neighbor_ids)
+            neighbor_seq = self.cellembs[neighbor_ids]
+            neighbor_seq[mask] = 0.0 # Zero out embeddings for padded parts
+            # print(neighbor_seq)
+            yield trajs_emb_cell, None, neighbor_seq, trajs_len, sub_simi
             count_i += 1
 
 
@@ -354,7 +366,18 @@ class TrajSimi:
         truths_k_idx = truths_k_idx.cpu()
 
         tp = sum([np.intersect1d(preds_k_idx[i], truths_k_idx[i]).size for i in range(preds_k_idx.shape[0])])
-        # print([np.intersect1d(preds_k_idx[i], truths_k_idx[i]).size for i in range(preds_k_idx.shape[0])])
+        # # print([np.intersect1d(preds_k_idx[i], truths_k_idx[i]).size for i in range(preds_k_idx.shape[0])])
+
+        # tps = [np.intersect1d(preds_k_idx[i], truths_k_idx[i]).size for i in range(preds_k_idx.shape[0])]
+
+        # tps_tensor = torch.tensor(tps, dtype=torch.int64).unsqueeze(1)  # [B,1]
+        # combined = torch.cat([tps_tensor, preds_k_idx], dim=1)  # [B, 1+K]
+        # _, order = torch.sort(combined[:, 0], descending=True)  # sort by first column
+        # sorted_preds_with_tps = combined[order]  # [B, 1+K], highest-tps first
+        # print(sorted_preds_with_tps)
+        # sorted_idx = sorted_preds_with_tps[:, 1:]  # [B, K]
+        # np.save('tjepa_beijing_idx.npy', combined[:, 1:].cpu().numpy())
+
         return (tp - preds.shape[0]) / (truth_topk * preds.shape[0])
 
 

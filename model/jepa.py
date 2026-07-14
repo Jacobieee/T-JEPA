@@ -37,34 +37,33 @@ class JEPA_base(nn.Module):
     def __init__(self, M=4):
         super(JEPA_base, self).__init__()
         self.M = M
-        # self.target_encoder = TransformerEncoder(input_dim=4,
-        #                                          embed_dim=Config.seq_embedding_dim,
-        #                                          num_heads=Config.attn_head,
-        #                                          ff_dim=Config.hidden_dim,
-        #                                          num_layers=Config.attn_layer)
-        #
-        # self.context_encoder = TransformerEncoder(input_dim=4,
-        #                                          embed_dim=Config.seq_embedding_dim,
-        #                                          num_heads=Config.attn_head,
-        #                                          ff_dim=Config.hidden_dim,
-        #                                          num_layers=Config.attn_layer)
+
         self.target_encoder = BaseBERT(Config, input_dim=2,
                                        hidden_dim=Config.hidden_dim,
                                        num_layers=Config.attn_layer,
                                        nheads=Config.attn_head,
                                        maxlen=Config.max_traj_len+1)
-        # self.target_encoder.load_state_dict(torch.load('/mnt/data728/lihuan/my_proj/encoder_weights.pth'))
+
         self.context_encoder = BaseBERT(Config, input_dim=2,
                                        hidden_dim=Config.hidden_dim,
                                        num_layers=Config.attn_layer,
                                        nheads=Config.attn_head,
                                        maxlen=Config.max_traj_len+1)
 
-        # self.context_encoder.load_state_dict(torch.load('/mnt/data728/lihuan/my_proj/encoder_weights.pth'))
-
         self.norm = nn.LayerNorm(Config.seq_embedding_dim)
         self.pe = nn.Parameter(torch.randn(1, Config.max_traj_len, Config.cell_embedding_dim))
-        self.latent_var = nn.Parameter(torch.randn(1, 1, Config.cell_embedding_dim))
+        self.latent_var = nn.Parameter(torch.randn(1, Config.max_traj_len+1, Config.cell_embedding_dim))
+
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=Config.cell_embedding_dim,
+            num_heads=4,
+            batch_first=True
+        )
+        self.proj_q = nn.Linear(Config.cell_embedding_dim * 2, Config.cell_embedding_dim)
+
+        # Normalize features before Linear projection
+        self.traj_o_norm = nn.LayerNorm(2)  # Normalize the 2 input features (turning_angle, sinuosity)
+        self.traj_o_proj = nn.Linear(2, Config.seq_embedding_dim)
         self.predictor = Decoder(dim=Config.cell_embedding_dim, depth=2, heads=8)
 
         self.proj_out = nn.Linear(Config.seq_embedding_dim, Config.seq_embedding_dim)
@@ -79,70 +78,95 @@ class JEPA_base(nn.Module):
             init_weights(m)
 
 
+
+
     @staticmethod
-    def mask_tensor(x, src_padding_mask, mask_ratio, succ_prob=0.5):
+    def mask_tensor(x, src_padding_mask, mask_ratio, succ_prob=0.5, m_count=4, valid=None, non_padded_len=None):
         """
-        Mask a tensor with a given mask ratio, considering the padding mask and
-        a probability to apply successive masking.
+        Vectorized generator for M masking groups.
 
         Args:
-        - x (torch.Tensor): input embedding with shape [L, B, d].
-        - src_padding_mask (torch.Tensor): Padding mask with shape [batch, len], True for padded positions.
-        - mask_ratio (float): The ratio of len to be masked.
-        - succ_prob (float): The probability of applying successive masking.
+        - x: [B, L, d]
+        - src_padding_mask: [B, L], True for padding positions
+        - mask_ratio: float or scalar-like tensor
+        - succ_prob: probability to use successive (contiguous) masking
+        - m_count: number of masking groups M
+        - valid: [B, L] (optional) precomputed valid mask
+        - non_padded_len: [B] (optional) precomputed non-padded lengths
 
         Returns:
-        - torch.Tensor: target points, target point indices.
+        - masked_x: [M, B, L, d]
+        - masks: [M, B, L]
+        - mask_indices: [] (placeholder for API compatibility)
         """
-        # traj_emb, traj_emb_p, src_padding_mask = x
         B, L, _ = x.shape
-        # Initialize a mask for all positions as True (indicating inclusion)
-        mask = torch.zeros((B, L), dtype=torch.bool, device=x.device)
-        mask_indices = []  # To store mask indices for each batch
-        for b in range(B):
-            # calculate the non-padding part.
-            non_padded_len = L - src_padding_mask[b].sum().item()
-            num_mask = int(non_padded_len * mask_ratio)
-            # print(f"masking {num_mask} points.")
-            # Ensure num_mask is not zero to proceed with masking
-            if num_mask > 0:
-                if torch.rand(1).item() < succ_prob:
-                    # print("successive padding.")
-                    # Successive masking
-                    start = torch.randint(0, non_padded_len - num_mask + 1, (1,)).item()
-                    indices = torch.arange(start, start + num_mask, device=x.device)
-                    mask[b, indices] = True
-                else:
-                    # print("random padding.")
-                    # Random masking
-                    non_padded_indices = torch.nonzero(~src_padding_mask[b], as_tuple=False).squeeze()
-                    # if 0 in non_padded_indices:
-                    #     non_padded_indices = non_padded_indices[non_padded_indices != 0]
-                    indices = non_padded_indices[torch.randperm(len(non_padded_indices))[:num_mask]]
-                    mask[b, indices] = True
+        device = x.device
 
-                mask_indices.append(indices)
-        # Invert the source padding mask and overlay the target mask.
-        # so that the masked parts are False.
-        # inv_src_padding_mask = ~src_padding_mask.transpose(0, 1)
-        # combined_mask = mask & inv_src_padding_mask
-        # print(combined_mask)
-        # Apply the combined mask to traj_emb
-        # masked_x = torch.where(combined_mask.unsqueeze(-1), torch.tensor(0.0, device=x.device, dtype=x.dtype), x)
-        masked_x = x * mask.unsqueeze(-1).to(x.dtype)
-        # mask = torch.stack(mask, dim=1)
+        # Valid positions (non-padding) - use precomputed if available
+        if valid is None:
+            valid = ~src_padding_mask  # [B, L]
+        if non_padded_len is None:
+            non_padded_len = valid.sum(dim=1)  # [B]
+        num_mask = (non_padded_len.float() * float(mask_ratio)).long().clamp(min=0, max=L)  # [B]
 
-        return masked_x, mask, mask_indices
-        # return mask_indices     # [B, len]
+        # Choose masking strategy per (m, b): successive vs random
+        successive_choice = (torch.rand(m_count, B, device=device) < succ_prob) & (num_mask > 0).unsqueeze(0)
+
+        # Random masking: select top-k per row using per-position random scores
+        rand_scores = torch.rand(m_count, B, L, device=device)
+        rand_scores = rand_scores.masked_fill(~valid.unsqueeze(0), -1.0)  # exclude padding by pushing them to the end
+
+
+        num_mask_max = num_mask.max().item()
+        if num_mask_max > 0:
+            # Use topk to get top indices, k needs to be at least as large as max num_mask
+            k = min(num_mask_max, L)
+            _, top_indices = torch.topk(rand_scores, k=k, dim=2, largest=True)  # [M, B, k]
+            
+            # Initialize mask
+            mask_random = torch.zeros(m_count, B, L, dtype=torch.bool, device=device)
+            
+            # For each (m, b), set top num_mask[b] positions to True
+            # Use advanced indexing for vectorized assignment
+            k_range = torch.arange(k, device=device).view(1, 1, k).expand(m_count, B, -1)  # [M, B, k]
+            num_mask_expanded = num_mask.view(1, B, 1).expand(m_count, -1, k)  # [M, B, k]
+            select_mask = k_range < num_mask_expanded  # [M, B, k] - True for positions to keep
+            
+            # Vectorized assignment using advanced indexing
+            m_indices = torch.arange(m_count, device=device).view(m_count, 1, 1).expand(-1, B, k)
+            b_indices = torch.arange(B, device=device).view(1, B, 1).expand(m_count, -1, k)
+            mask_random[m_indices, b_indices, top_indices] = select_mask
+            
+            mask_random = mask_random & valid.view(1, B, L)  # [M, B, L]
+        else:
+            mask_random = torch.zeros(m_count, B, L, dtype=torch.bool, device=device)
+
+        # Successive masking: sample a start index per (m, b), take a length of num_mask[b]
+        span_max_start = (non_padded_len - num_mask).clamp_min(0)  # [B]
+        start = (torch.rand(m_count, B, device=device) * (span_max_start + 1).float().unsqueeze(0)).floor().long()
+        positions = torch.arange(L, device=device).view(1, 1, L)  # broadcasted index grid
+        in_span = (positions >= start.unsqueeze(-1)) & (positions < (start + num_mask.view(1, B)).unsqueeze(-1))
+        mask_successive = in_span & valid.view(1, B, L)  # [M, B, L]
+
+        # Per (m, b) select which mask to use
+        masks = torch.where(successive_choice.unsqueeze(-1), mask_successive, mask_random)  # [M, B, L]
+        masked_x = x.unsqueeze(0) * masks.unsqueeze(-1).to(x.dtype)  # [M, B, L, d]
+
+        return masked_x, masks, []
 
 
     @torch.no_grad()
-    def target_seg(self, x, Config):
+    def target_seg(self, x, Config, valid=None, non_padded_len=None):
         """
         All we need is the target input, and the M * B masked segments.
+        
+        Args:
+        - x: tuple containing (cell_emb, traj_o, num_points, src_padding_mask, adj)
+        - Config: configuration object
+        - valid: [B, L] (optional) precomputed valid mask
+        - non_padded_len: [B] (optional) precomputed non-padded lengths
         """
         cell_emb, traj_o, num_points, src_padding_mask, adj = x
-        self.target_encoder.eval()
         # generate embeddings by target encoder.
         x_emb = self.target_encoder(**{
             'cell_emb': cell_emb,
@@ -150,29 +174,19 @@ class JEPA_base(nn.Module):
             'src_padding_mask': src_padding_mask,
             'adj': adj
         })  # [B, L, d]
-        # print(x_emb)
-        # x_emb = self.norm(x_emb)
+
         mask_ratio = Config.mask_ratio
         # get a random mask ratio and determine if the mask will be successive.
         idx = torch.randint(low=0, high=len(mask_ratio), size=(1,))
         r = mask_ratio[idx]
-        # print(r)
-        # target_segments = []
-        all_masks = []      # masks for [M, B, L]
-        all_mask_x = []     # masked padded sequence for [M, B, L, d]
-        for m in range(self.M):
-            # the mask indices will be successive or not for a whole batch.
-            mask_x, masks, mask_indices = self.mask_tensor(x_emb, src_padding_mask, r, Config.succ_prob)
-            all_masks.append(masks)
-            all_mask_x.append(mask_x)
 
-        all_masks = torch.stack(all_masks, dim=0)
-        all_mask_x = torch.stack(all_mask_x, dim=0)
+        all_mask_x, all_masks, _ = self.mask_tensor(x_emb, src_padding_mask, r, Config.succ_prob, self.M, valid, non_padded_len)
+
 
         return all_mask_x, all_masks
 
 
-    def context_seg(self, x, Config, all_masks):
+    def context_seg(self, x, Config, all_masks, valid=None, non_padded_len=None):
         cell_emb, traj_o, src_padding_mask, adj = x
         lb = Config.context_lb  # Lower bound ratio for sampling
 
@@ -181,67 +195,66 @@ class JEPA_base(nn.Module):
         # Generate a unique sampling ratio for each trajectory in the batch within [lb, 1]
         ratios = torch.rand((B,), device=cell_emb.device).clamp(min=lb, max=1.0)
         # determine the number of samples kept considering the padding masks.
-        non_padded_lens = L - src_padding_mask.sum(dim=1)
+        # Use precomputed non_padded_len if available
+        if non_padded_len is None:
+            non_padded_lens = L - src_padding_mask.sum(dim=1)
+        else:
+            non_padded_lens = non_padded_len
         num_samples = (non_padded_lens.float() * ratios).long()
 
-        sampled_indices_list = [torch.empty(0, dtype=torch.long, device=cell_emb.device) for _ in range(B)]
-        aug_sampled_emb = torch.zeros((self.M, B, L, d), device=cell_emb.device)
-        # aug_sampled_traj_o = torch.zeros((self.M, B, L, 2), device=cell_emb.device)
-        aug_sampled_adj = torch.zeros((self.M, B, L, 9, d), device=cell_emb.device)
-        aug_src_padding_mask = torch.ones((self.M, B, L), dtype=torch.bool, device=cell_emb.device)
-        # formulate the context.
-        for b in range(B):
-            # is true if the point is not on a position of a padding mask.
-            valid_indices = torch.arange(L)[~src_padding_mask[b]].to(cell_emb.device)
-            # sample selected indices according to ratio.
-            sampled_indices = valid_indices[torch.randperm(valid_indices.size(0))[:num_samples[b]]]
-            # print(f"{num_samples[b]} sample indices {sampled_indices} in traj. of length {torch.sum(~src_padding_mask[b, :])} in pm {src_padding_mask.shape[-1]}")
-            # print(torch.sum(~src_padding_mask[b, :]))
-            # print(f"indices{sampled_indices}")
-            # assert torch.max(sampled_indices) < torch.sum(~src_padding_mask[b, :])
-            sampled_indices_list[b] = sampled_indices
-            # find overlaps
-            curr_src_pad = src_padding_mask[b, :]
-            for m in range(self.M):
-                masks = all_masks[m, b, :]
-                # print(f"trg mask: {torch.where(masks==1)}")
-                # print(~sampled_indices)
-                sample_mask = torch.zeros(L, dtype=torch.bool, device=cell_emb.device)
-                sample_mask[sampled_indices] = 1
-                # overlap_mask = ~sampled_indices.unsqueeze(1).eq(masks).any(dim=-1)
-                overlap_mask = sample_mask & masks
-                sample_mask[overlap_mask.bool()] = 0
-                # print(f"overlaps: {torch.where(overlap_mask==1)}")
-                valid_mask = sample_mask
-                valid_sampled_indices = torch.where(valid_mask.bool()==1)
-                # print(f"valid: {valid_sampled_indices}")
-                #
-                # valid_mask = torch.zeros(L, dtype=torch.bool, device=traj_emb.device)
-                # valid_mask[valid_sampled_indices] = True
+        # Vectorized context sampling: sample positions per (M, B) independently, then remove overlaps with all_masks
+        # Use precomputed valid if available
+        if valid is None:
+            valid = ~src_padding_mask  # [B, L]
+        
+        # Sample positions per (M, B) using vectorized ranking (similar to mask_tensor)
+        # Generate independent random scores for each M and B
+        sample_scores = torch.rand(self.M, B, L, device=cell_emb.device)  # [M, B, L]
+        sample_scores = sample_scores.masked_fill(~valid.unsqueeze(0), -1.0)  # exclude padding
 
-                """test valid mask"""
-                # print(f"{len(valid_sampled_indices[0])} valid samples {valid_sampled_indices} in traj. of length {torch.sum(~src_padding_mask[b, :])} in pm {src_padding_mask.shape[-1]}" )
-                # print()
-                # assert torch.max(valid_sampled_indices[0]) < torch.sum(~src_padding_mask[b, :])
 
-                curr_emb = cell_emb[b, :, :] * valid_mask.unsqueeze(-1)
-                # curr_traj_o = traj_o[b, :, :] * valid_mask.unsqueeze(-1)
-                curr_adj = adj[b, :, :, :] * valid_mask.unsqueeze(-1).unsqueeze(-1)
-                # print(curr_t.shape)
-                # print(curr_emb.shape)
-                assert curr_emb.shape[0] == L
-                # curr_emb = traj_emb[valid_sampled_indices, b, :]
-                # curr_emb_p = traj_emb_p[valid_sampled_indices, b, :]
-
-                aug_sampled_emb[m, b, :, :] = curr_emb
-                # aug_sampled_traj_o[m, b, :, :] = curr_traj_o
-                aug_sampled_adj[m, b, :] = curr_adj
-                aug_src_padding_mask[m, b, :] = curr_src_pad
+        # Optimized version using topk instead of argsort
+        num_samples_max = num_samples.max().item()
+        if num_samples_max > 0:
+            # Use topk to get top indices, k needs to be at least as large as max num_samples
+            k = min(num_samples_max, L)
+            _, top_indices = torch.topk(sample_scores, k=k, dim=2, largest=True)  # [M, B, k]
+            
+            # Initialize sample_mask
+            sample_mask = torch.zeros(self.M, B, L, dtype=torch.bool, device=cell_emb.device)
+            
+            # For each (m, b), set top num_samples[b] positions to True
+            # Use advanced indexing for vectorized assignment
+            k_range = torch.arange(k, device=cell_emb.device).view(1, 1, k).expand(self.M, B, -1)  # [M, B, k]
+            num_samples_expanded = num_samples.view(1, B, 1).expand(self.M, -1, k)  # [M, B, k]
+            select_mask = k_range < num_samples_expanded  # [M, B, k] - True for positions to keep
+            
+            # Vectorized assignment using advanced indexing
+            m_indices = torch.arange(self.M, device=cell_emb.device).view(self.M, 1, 1).expand(-1, B, k)
+            b_indices = torch.arange(B, device=cell_emb.device).view(1, B, 1).expand(self.M, -1, k)
+            sample_mask[m_indices, b_indices, top_indices] = select_mask
+            
+            sample_mask = sample_mask & valid.view(1, B, L)  # [M, B, L]
+        else:
+            sample_mask = torch.zeros(self.M, B, L, dtype=torch.bool, device=cell_emb.device)
+        
+        # Compute overlaps with all_masks [M, B, L]
+        overlap_mask = sample_mask & all_masks  # [M, B, L]
+        
+        # Remove overlaps: final mask = sampled positions minus overlapping positions
+        valid_mask = sample_mask & ~overlap_mask  # [M, B, L]
+        
+        # Apply masks to embeddings and adjacency
+        aug_sampled_emb = cell_emb.unsqueeze(0) * valid_mask.unsqueeze(-1).to(cell_emb.dtype)  # [M, B, L, d]
+        # aug_sampled_traj_o = traj_o.unsqueeze(0) * valid_mask.unsqueeze(-1).to(traj_o.dtype)  # [M, B, L, d]
+        aug_sampled_traj_o = traj_o.unsqueeze(0).repeat(self.M, 1, 1, 1).to(traj_o.dtype)  # [M, B, L, d]
+        aug_sampled_adj = adj.unsqueeze(0) * valid_mask.unsqueeze(-1).unsqueeze(-1).to(adj.dtype)  # [M, B, L, 9, d]
+        aug_src_padding_mask = src_padding_mask.unsqueeze(0).expand(self.M, -1, -1)  # [M, B, L]
 
         # the final embeddings will be in [M, L, B, d].
         # print(f"creating {self.M*B} training samples.")
 
-        return aug_sampled_emb, None, aug_src_padding_mask, aug_sampled_adj
+        return aug_sampled_emb, aug_sampled_traj_o, aug_src_padding_mask, aug_sampled_adj
 
     def loss_fn(self, context_out, targets):
         assert context_out.shape == targets.shape, "context_out and targets must have the same shape"
@@ -251,7 +264,7 @@ class JEPA_base(nn.Module):
         # mse_loss = F.mse_loss(context_out, targets, reduction='none')
         loss = self.loss(context_out, targets)
 
-        loss = loss.sum(dim=(-1,-2))
+        loss = loss.sum(dim=-1)
         loss = loss.mean()
 
         return loss
@@ -276,6 +289,10 @@ class JEPA_base(nn.Module):
         max_traj_len = num_points.max().item()  # in essense -- trajs1_len[0]
         src_padding_mask = torch.arange(max_traj_len, device=Config.device)[None, :] >= num_points[:, None]
 
+        # Precompute valid and non_padded_len to avoid repeated calculation
+        valid = ~src_padding_mask  # [B, L]
+        non_padded_len = valid.sum(dim=1)  # [B]
+
         # if not training, encode the whole sequence.
         if mode != "train":
             return self.context_encoder(**{
@@ -286,189 +303,94 @@ class JEPA_base(nn.Module):
             })
         # ----- else -----
         # get target and context segments.
-        target_emb, all_masks = self.target_seg((cell_emb, traj_o, num_points, src_padding_mask, adj), Config)
+        # Pass precomputed values to avoid recalculation
+        target_emb, all_masks = self.target_seg((cell_emb, traj_o, num_points, src_padding_mask, adj), Config, valid, non_padded_len)
 
         aug_sampled_emb, aug_sampled_traj_o, aug_src_padding_mask, aug_sampled_adj = self.context_seg(
-            (cell_emb, traj_o, src_padding_mask, adj), Config, all_masks)
+            (cell_emb, traj_o, src_padding_mask, adj), Config, all_masks, valid, non_padded_len)
 
-        context_out = torch.zeros((self.M, B, L, d), device=cell_emb.device)
-        # all_cls_token = torch.zeros((self.M, B, d), device=cell_emb.device)
-        for m in range(self.M):
-            # encoder
-            # resulting target [L, B, d].
-            out = self.context_encoder(**{
-                'cell_emb': aug_sampled_emb[m],
-                # 'traj_o': aug_sampled_traj_o[m],
-                'traj_o': None,
-                'src_padding_mask': aug_src_padding_mask[m],
-                'adj': aug_sampled_adj[m]
-            })
+        # Vectorized processing: merge M and B dimensions for batch processing
+        # Reshape [M, B, ...] to [M*B, ...] for batch processing
+        # Use reshape() instead of view() to handle potentially non-contiguous tensors (e.g., from expand())
+        MB = self.M * B
+        aug_sampled_emb_flat = aug_sampled_emb.reshape(MB, L, d)  # [M*B, L, d]
+        aug_sampled_traj_o_flat = aug_sampled_traj_o.reshape(MB, L, 2)  # [M*B, L, 2]
+        aug_src_padding_mask_flat = aug_src_padding_mask.reshape(MB, L)  # [M*B, L]
+        aug_sampled_adj_flat = aug_sampled_adj.reshape(MB, L, Config.n_neighbors, d)  # [M*B, L, n_neighbors, d]
+        all_masks_flat = all_masks.reshape(MB, L)  # [M*B, L]
+        
+        # Batch encoder: process all M*B samples at once
+        out = self.context_encoder(**{
+            'cell_emb': aug_sampled_emb_flat,
+            'traj_o': None,
+            'src_padding_mask': aug_src_padding_mask_flat,
+            'adj': aug_sampled_adj_flat
+        })  # [M*B, L, d]
+        
+        # Batch positional encoding and latent variable
+        # pe = self.pe.repeat(MB, 1, 1)  # [M*B, max_len, d]
+        # pe = pe[:, :L, :]  # [M*B, L, d]
+        pe = self.pe.expand(MB, -1, -1)[:, :L, :]
+        pe = pe * all_masks_flat.unsqueeze(-1).to(pe.dtype)  # [M*B, L, d]
 
-            # decoder
-            # todo: will there be a valid memory mask?
-            # tgt, memory, tgt_mask = target_emb, out, all_masks
-            # tgt += self.pe
-            # add latent variable z.
-            mask = all_masks[m, :, :]  # [B, L]
-            pe = self.pe.repeat(B, 1, 1)
-            pe = pe[:, :L, :]
-            # just get the PE.
-            # pe = self.pe(out)
-            pe = pe * mask.unsqueeze(-1).to(pe.dtype)
-            z = self.latent_var.repeat(B, L, 1)
-            z += pe
-            # print(z.shape)
-            out = torch.cat([out, z], dim=1)
-            # cls_token = out[:, 0, :]
-            # out = out.permute(1, 0, 2)
-            # decode
-            out = self.predictor(out)
-            # for layer in self.layers:
-            #     out = layer(out)
+        # prepare the latent variable.
+        # z = self.latent_var.repeat(MB, 1, 1)  # [M*B, L, d]
+        z = self.latent_var.expand(MB, -1, -1)[:, :L, :]
+        # z = z[:, :L, :]  # [M*B, L, d]
+        z = z + pe
 
-            # out = out.permute(1, 0, 2)
-            out = out[:, L:, :]
-            out = self.norm(out)
-            # print(out.shape)
+        if mode == "train":
+            _noise_scale = 0.001
+            noise = torch.randn_like(z) * _noise_scale
+            z = z + noise
 
-            out = self.proj_out(out)
-            # print(out)
-            # print(out.shape)
-            # mask the non-target values according to all_masks.
-            # out = out * mask.unsqueeze(-1).to(out.dtype)      # [B, L, d]
-            context_out[m, :, :, :] = out
-            # all_cls_token[m, :, :] = cls_token
+        # Normalize features before Linear projection
+        traj_o_norm = self.traj_o_norm(aug_sampled_traj_o_flat)  # [M*B, L, 2]
+        feat_o = self.traj_o_proj(traj_o_norm)   # [M*B, L, d]
+
+        z = torch.cat([z, feat_o], dim=-1)  # [M*B, L, 2*d]
+        z = self.proj_q(z)  # [M*B, L, d]
+
+
+        out, _ = self.cross_attn(z, out, out)
+        out = out + z
+
+        # Batch decoder
+        out = self.predictor(out)  # [M*B, 2*L, d]
+        
+        # Extract prediction part and apply normalization and projection
+        out = self.norm(out)  # [M*B, L, d]
+        out = self.proj_out(out)  # [M*B, L, d]
+        
+        # Reshape back to [M, B, L, d]
+        context_out = out.reshape(self.M, B, L, d)  # [M, B, L, d]
 
         return context_out, target_emb
 
+    def interpret_ft(self, cell_emb, traj_o, num_points, adj):
+        B, L, d = cell_emb.shape
+        max_traj_len = num_points.max().item()  # in essense -- trajs1_len[0]
+        src_padding_mask = torch.arange(max_traj_len, device=Config.device)[None, :] >= num_points[:, None]
+        traj_embs = self.context_encoder(**{
+                'cell_emb': cell_emb,
+                'traj_o': traj_o,
+                'src_padding_mask': src_padding_mask,
+                'adj': adj
+            })
+
+        pe = self.pe.repeat(B, 1, 1)
+        pe = pe[:, :L, :]
+
+        z = self.latent_var.repeat(B, L, 1)
+        z += pe
+
+
+        return traj_embs, src_padding_mask
+
     def load_checkpoint(self):
-        checkpoint_file = '{}/{}_Traj-JEPA_adj_fuse_new{}.pt'.format(Config.checkpoint_dir, Config.dataset_prefix,
+        checkpoint_file = '{}/{}_t-jepa_porto_pretrain_motion_ca_noise_ep20_1e-4_mask234{}.pt'.format(Config.checkpoint_dir, Config.dataset_prefix,
                                                           Config.dumpfile_uniqueid)
         checkpoint = torch.load(checkpoint_file)
         self.load_state_dict(checkpoint['model_state_dict'])
         return self
 
-
-def test_masking():
-    # jepa = JEPA_base()
-
-    def mask_tensor(x, mask_ratio, succ_prob=0.5):
-        """
-        Mask a tensor with a given mask ratio, considering the padding mask and
-        a probability to apply successive masking.
-
-        Args:
-        - traj_emb (torch.Tensor): The input tensor with shape [len, batch, d].
-        - traj_emb_p (torch.Tensor): Positional embeddings tensor with shape [len, batch, 4].
-        - src_padding_mask (torch.Tensor): Padding mask with shape [batch, len], True for padded positions.
-        - mask_ratio (float): The ratio of len to be masked.
-        - succ_prob (float): The probability of applying successive masking.
-
-        Returns:
-        - torch.Tensor: The masked tensor of traj_emb.
-        """
-        traj_emb, traj_emb_p, src_padding_mask = x
-        L, B, _ = traj_emb.shape
-        # Initialize a mask for all positions as True (indicating inclusion)
-        mask = torch.ones((L, B), dtype=torch.bool, device=traj_emb.device)
-
-        for b in range(B):
-            # calculate the non-padding part.
-            non_padded_len = L - src_padding_mask[b].sum().item()
-            num_mask = int(non_padded_len * mask_ratio)
-            print(f"masking {num_mask} points.")
-            # Ensure num_mask is not zero to proceed with masking
-            if num_mask > 0:
-                if torch.rand(1).item() < succ_prob:
-                    print("successive masking.")
-                    # Successive masking
-                    start = torch.randint(0, non_padded_len - num_mask + 1, (1,)).item()
-                    mask[start:start + num_mask, b] = False
-                else:
-                    print("random masking.")
-                    # Random masking
-                    non_padded_indices = torch.nonzero(~src_padding_mask[b], as_tuple=False).squeeze()
-                    mask_indices = non_padded_indices[torch.randperm(len(non_padded_indices))[:num_mask]]
-                    mask[mask_indices, b] = False
-
-        # Invert the source padding mask and overlay the target mask.
-        # so that the masked parts are False.
-        inv_src_padding_mask = ~src_padding_mask.transpose(0, 1)
-        combined_mask = mask & inv_src_padding_mask
-        print(combined_mask)
-        # Apply the combined mask to traj_emb
-        masked_traj_emb = traj_emb * combined_mask.unsqueeze(-1).to(traj_emb.dtype)
-        masked_traj_emb_p = traj_emb_p * combined_mask.unsqueeze(-1).to(traj_emb_p.dtype)
-        # print(masked_traj_emb[:, 0, :].shape)
-        return masked_traj_emb, masked_traj_emb_p, src_padding_mask
-
-
-    # seq1 = torch.randn(16, 2)  # Length 5
-    # seq2 = torch.randn(10, 2)  # Length 3
-    # seq3 = torch.randn(12, 2)  # Length 4
-    #
-    # # Batch size is 1 for this example, d is 2
-    # batch_size = 1
-    # d = 2
-    #
-    # # Manually pad sequences (for demonstration)
-    # padded_seqs = pad_sequence([seq1, seq2, seq3], batch_first=False, padding_value=0)
-    #
-    # # Generate src_padding_mask
-    # seq_lengths = torch.tensor([16, 10, 12])  # Actual lengths of sequences
-    # max_length = padded_seqs.shape[0]
-    # src_padding_mask = torch.arange(max_length)[None, :] >= seq_lengths[:, None]
-    #
-    # # Additional features tensor (dummy for demonstration)
-    # traj_emb_p = torch.randn(max_length, batch_size, 4)
-    #
-    # # Mask ratio and successive probability
-    # mask_ratio = 0.2
-    # succ_prob = 0.5
-    #
-    # masked_traj_emb, masked_traj_emb_p, _ = mask_tensor((padded_seqs, traj_emb_p, src_padding_mask),
-    #                                                     mask_ratio, succ_prob)
-
-    # Base latitude and longitude for the starting point (somewhere in Manhattan)
-    base_lat, base_lon = 40.7580, -73.9855  # Near Times Square
-
-    # Generate trajectories with linear movement simulating blocks traveled
-    # Trajectory 1: Length 18
-    traj1 = torch.tensor([[base_lat + i * 0.001, base_lon + i * 0.002] for i in range(18)])
-    # Trajectory 2: Length 12
-    traj2 = torch.tensor([[base_lat + i * 0.0015, base_lon + i * 0.001] for i in range(12)])
-    # Trajectory 3: Length 14
-    traj3 = torch.tensor([[base_lat + i * 0.0005, base_lon - i * 0.0015] for i in range(14)])
-    # Combine trajectories into a batch
-    trajectories = [traj1, traj2, traj3]
-
-    # Pad sequences to the same length
-    padded_trajectories = pad_sequence(trajectories, batch_first=False, padding_value=0)  # Padding value 0 is arbitrary here
-    batch_size = 1
-    # d = 2
-    # Determine sequence lengths before padding
-    seq_lengths = torch.tensor([18, 12, 14])
-    # seq_lengths = torch.tensor([len(traj) for traj in trajectories])
-
-    # Generate the padding mask (True for padded positions)
-    max_length = padded_trajectories.shape[0]  # Length after padding
-    src_padding_mask = torch.arange(max_length)[None, :] >= seq_lengths[:, None]
-
-    mask_ratio = 0.2
-    succ_prob = 0.5
-
-    masked_traj_emb, masked_traj_emb_p, _ = mask_tensor((padded_trajectories, padded_trajectories, src_padding_mask),
-                                                        mask_ratio, succ_prob)
-    # print(masked_traj_emb)
-    np.save("vis_traj.npy", masked_traj_emb[:, 0, :].detach().numpy())
-    np.save("ori_traj.npy", traj1)
-
-"""
-these are the inputs of TrajCL.
-"""
- # trajs1_emb, trajs1_emb_p, trajs1_len, trajs2_emb, trajs2_emb_p, trajs2_len
-
- # we might need traj_emb, traj_emb_p, traj_len
-
-if __name__ == '__main__':
-    pass

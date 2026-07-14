@@ -1,12 +1,14 @@
 import os
 import time
 import logging
-import pickle5 as pickle
+try:
+    import pickle5 as pickle
+except ModuleNotFoundError:
+    import pickle
 import pandas as pd
 from torch.utils.data import Dataset
 import numpy as np
 from config import Config
-
 # 1) read raw pd, 2) split into 3 partitions
 def read_traj_dataset(file_path):
     logging.info('[Load traj dataset] START.')
@@ -14,16 +16,22 @@ def read_traj_dataset(file_path):
     trajs = pd.read_pickle(file_path)
 
     l = trajs.shape[0]
-    if Config.dataset_prefix == "porto_20200_new" or Config.dataset_prefix == "beijing_new" or Config.dataset_prefix == "geolife":
-        train_idx = (int(l*0), Config.train_idx)
-    else:
-        train_idx = (int(l * 0), int(l * 0.7))
+    if Config.pretrain_use_all_data:
+        train_idx = (0, l)
+        eval_idx = (l, l)
+        test_idx = (l, l)
     # train_idx = (int(l*0), 200000)        # for porto
     # train_idx = (int(l * 0), 70000)       # for t-drive
     # train_idx = (int(l * 0), int(l*0.7))  # for tky & nyc
-    # train_idx = (int(l * 0), 35000)         # for geolife
-    eval_idx = (int(l*0.7), int(l*0.8))
-    test_idx = (int(l*0.8), int(l*1.0))
+    # train_idx = (int(l * 0), 35000)       # for geolife
+    elif Config.dataset_prefix == "porto_20200_new" or Config.dataset_prefix == "beijing/beijing" or Config.dataset_prefix == "geolife/geolife":
+        train_idx = (int(l*0), Config.train_idx)
+        eval_idx = (int(l*0.7), int(l*0.8))
+        test_idx = (int(l*0.8), int(l*1.0))
+    else:
+        train_idx = (int(l*0), int(l*0.7))
+        eval_idx = (int(l*0.7), int(l*0.8))
+        test_idx = (int(l*0.8), int(l*1.0))
 
     _train = TrajDataset(trajs[train_idx[0]: train_idx[1]])
     _eval = TrajDataset(trajs[eval_idx[0]: eval_idx[1]])
@@ -42,13 +50,7 @@ class TrajDataset(Dataset):
     def __getitem__(self, index):
         # return traj cells, traj offset, traj time
         traj = np.array(self.data.loc[index].merc_seq)
-        # traj_o = np.array(self.data.loc[index].traj_p)
-        # traj_t = np.array(self.data.loc[index].time_each_point).reshape(-1, 1)
-        # print(traj_o)
-        # print(traj_t)
         return traj
-        # return traj_o
-        # return np.concatenate((traj, traj_o), axis=1)
 
     def __len__(self):
         return self.data.shape[0]
@@ -61,12 +63,17 @@ def read_trajsimi_traj_dataset(file_path):
 
     df_trajs = pd.read_pickle(file_path)
     offset_idx = int(df_trajs.shape[0] * 0.7) # use eval dataset
-    df_trajs = df_trajs.iloc[offset_idx : offset_idx + 10000]
-    assert df_trajs.shape[0] == 10000
-    l = 10000
-    # df_trajs = df_trajs.iloc[offset_idx: offset_idx + 5000]
-    # assert df_trajs.shape[0] == 5000
-    # l = 5000
+
+
+    if Config.dataset == "geolife":
+        df_trajs = df_trajs.iloc[offset_idx: offset_idx + 5000]
+        assert df_trajs.shape[0] == 5000
+        l = 5000
+    else:
+        df_trajs = df_trajs.iloc[offset_idx: offset_idx + 10000]
+        assert df_trajs.shape[0] == 10000
+        l = 10000
+
 
     train_idx = (int(l*0), int(l*0.7))
     eval_idx = (int(l*0.7), int(l*0.8))
