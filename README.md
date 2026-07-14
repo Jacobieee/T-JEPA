@@ -2,6 +2,8 @@
 
 This is the official code for [T-JEPA: A Joint-Embedding Predictive Architecture for Trajectory Similarity Computation](https://arxiv.org/abs/2406.12913). This paper has been accepted by SIGSPATIAL 2024.
 
+> **📢 Latest update:** The code has been optimized for **~4× faster inference**.
+
 If you find this work useful for your research, please cite:
 ```
 @inproceedings{li2024t,
